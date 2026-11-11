@@ -1,0 +1,70 @@
+// SWRTSpike.usf - Milestone 1.
+// 1 raio por pixel de RT contra um plano analitico (Z = PlaneZ). Sem BVH ainda: serve para validar
+// a integracao, a resolucao e a composicao. Substituido por SWRTRayGen.usf no Milestone 2.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+
+int2  RTExtent;
+float MaxDistance;
+float MaxRoughness;
+float PlaneZ;
+RWTexture2D<float4> OutReflection;
+
+float3 SkyGradient(float3 R)
+{
+	const float T = saturate(R.z * 0.5 + 0.5);
+	return lerp(float3(0.35, 0.40, 0.45), float3(0.10, 0.25, 0.60), T) * 2.0;
+}
+
+float3 PlaneColor(float2 XY)
+{
+	const float2 Cell = floor(XY / 200.0);               // quadrados de 2 m
+	const float Checker = fmod(abs(Cell.x + Cell.y), 2.0);
+	return lerp(float3(0.8, 0.15, 0.1), float3(0.9, 0.9, 0.9), Checker) * 2.0;
+}
+
+[numthreads(SWRT_THREADGROUP_SIZE, SWRT_THREADGROUP_SIZE, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (any(int2(DispatchThreadId.xy) >= RTExtent))
+	{
+		return;
+	}
+
+	// UV dentro do ViewRect interno (0..1). A resolucao de RT e independente da do GBuffer.
+	const float2 ViewUV   = (float2(DispatchThreadId.xy) + 0.5) / float2(RTExtent);
+	const float2 PixelPos = View.ViewRectMin.xy + ViewUV * View.ViewSizeAndInvSize.xy;
+	// VERIFY[7]: UV no espaco do buffer (o GBuffer pode ser maior que o ViewRect)
+	const float2 BufferUV = PixelPos * View.BufferSizeAndInvSize.zw;
+
+	const FGBufferData G = GetGBufferData(BufferUV);
+	// VERIFY[8]: LookupDeviceZ (SceneTexturesCommon.ush)
+	const float DeviceZ = LookupDeviceZ(BufferUV);
+
+	// Ceu (DeviceZ = 0 com Z invertido), sem shading, ou rugoso demais: nao atua.
+	if (DeviceZ <= 0.0 || G.ShadingModelID == SHADINGMODELID_UNLIT || G.Roughness > MaxRoughness)
+	{
+		OutReflection[DispatchThreadId.xy] = float4(0, 0, 0, 0);
+		return;
+	}
+
+	const float3 TranslatedWorld = SvPositionToTranslatedWorld(float4(PixelPos, DeviceZ, 1.0));
+	const float3 P = TranslatedWorld - View.PreViewTranslation;   // mundo absoluto (cm)
+	const float3 V = normalize(View.WorldCameraOrigin - P);
+	const float3 N = G.WorldNormal;
+	const float3 R = reflect(-V, N);
+
+	float3 Radiance = SkyGradient(R);
+	if (abs(R.z) > 1e-4)
+	{
+		const float T = (PlaneZ - P.z) / R.z;
+		if (T > 1.0 && T < MaxDistance) // plano de duas faces: serve de teto ou de chao conforme PlaneZ
+		{
+			Radiance = PlaneColor((P + R * T).xy);
+		}
+	}
+
+	// O SceneColor esta em unidades pre-expostas.
+	OutReflection[DispatchThreadId.xy] = float4(Radiance * View.PreExposure, 1.0);
+}

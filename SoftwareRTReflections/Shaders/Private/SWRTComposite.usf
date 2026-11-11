@@ -1,0 +1,61 @@
+// SWRTComposite.usf - compoe o reflexo (resolucao de RT) no SceneColor, na resolucao interna.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "/Engine/Private/BRDF.ush"
+
+Texture2D    ReflectionTexture;
+SamplerState ReflectionSampler;
+float        MaxRoughness;
+int          DebugMode;      // 0 normal, 1 so reflexo, 2 mascara de rugosidade, 3 magenta solido
+int          CompositeMode;  // 0 aditivo, 1 lerp pela confianca
+
+void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	// Debug 3: magenta solido, sem ler nada. Se isto nao aparecer, o passe nao chega ao ecra.
+	if (DebugMode == 3)
+	{
+		OutColor = float4(1.0, 0.0, 1.0, 1.0) * float4(View.PreExposure.xxx, 1.0);
+		return;
+	}
+
+	const float2 ViewUV   = (SvPosition.xy - View.ViewRectMin.xy) * View.ViewSizeAndInvSize.zw;
+	const float2 BufferUV = SvPosition.xy * View.BufferSizeAndInvSize.zw;
+
+	const FGBufferData G = GetGBufferData(BufferUV);
+	const float DeviceZ  = LookupDeviceZ(BufferUV);
+
+	if (DebugMode == 2)
+	{
+		OutColor = float4(G.Roughness.xxx * View.PreExposure, 1.0);
+		return;
+	}
+	if (DeviceZ <= 0.0 || G.ShadingModelID == SHADINGMODELID_UNLIT)
+	{
+		OutColor = float4(0, 0, 0, 0);
+		return;
+	}
+
+	const float4 Refl = Texture2DSampleLevel(ReflectionTexture, ReflectionSampler, ViewUV, 0);
+
+	// Fade da rugosidade perto do limite, para nao se ver o corte contra o SSR/captures.
+	const float Conf = Refl.a * (1.0 - smoothstep(MaxRoughness * 0.85, MaxRoughness, G.Roughness));
+
+	const float3 P = SvPositionToTranslatedWorld(float4(SvPosition.xy, DeviceZ, 1.0)) - View.PreViewTranslation;
+	const float3 V = normalize(View.WorldCameraOrigin - P);
+	const float  NoV = saturate(dot(G.WorldNormal, V));
+	// EnvBRDFApprox e analitico. EnvBRDF() exigiria ligar a textura de sistema PreIntegratedGF
+	// (+ PreIntegratedGFSampler) na struct de parametros do shader.
+	const float3 SpecWeight = EnvBRDFApprox(G.SpecularColor, G.Roughness, NoV);
+
+	if (DebugMode == 1 || CompositeMode == 1)
+	{
+		// blend = lerp(SceneColor, rgb, a)
+		OutColor = float4(Refl.rgb * (DebugMode == 1 ? 1.0 : SpecWeight), Conf);
+	}
+	else
+	{
+		// blend = SceneColor + rgb
+		OutColor = float4(Refl.rgb * SpecWeight * Conf, 0.0);
+	}
+}

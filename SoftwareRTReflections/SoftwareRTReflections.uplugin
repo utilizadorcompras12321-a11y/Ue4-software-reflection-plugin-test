@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0-M1",
+	"FriendlyName": "Software RT Reflections",
+	"Description": "Reflexos por ray tracing em software (compute shaders, DX11 SM5, sem DXR). Milestone 1: esqueleto, CVars, BVH builder testado e spike de composicao.",
+	"Category": "Rendering",
+	"CreatedBy": "",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "SoftwareRTReflections",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}

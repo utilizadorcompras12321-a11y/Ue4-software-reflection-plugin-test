@@ -1,0 +1,194 @@
+// SWRTBvhTraversal.ush - travessia da BVH4 comprimida (FBvh4NodeCompressed, 64 B).
+//
+// ESTADO: NAO COMPILADO NEM TESTADO em GPU. A logica espelha SWRTBvh.h (TraceWide + FBvh4Compressor),
+// que foi testada na CPU contra forca bruta (Tools/bvh_test.cpp). Ligar no Milestone 2.
+//
+// Layout do no (bytes), tem de coincidir com FBvh4NodeCompressed em SWRTBvh.h:
+//    0  float3 P            origem
+//   12  uint   ExpPacked    e0 | e1<<8 | e2<<16     (expoente enviesado; escala = asfloat(e << 23))
+//   16  uint4  Child        referencias de filho
+//   32  uint3  QLo          12 bytes: [filho*3 + eixo]
+//   44  uint3  QHi          12 bytes
+//   56  pad (8)
+//
+// Referencia de filho: 0xFFFFFFFF vazio | bit31 folha (bits 27..30 = n triangulos, bits 0..26 = primeiro) | indice de no.
+//
+// Requer (declarados pelo shader que inclui, ligados via parametros do Global Shader):
+//   ByteAddressBuffer     SWRTBvhNodes;
+//   StructuredBuffer<float3> SWRTPositions;
+//   StructuredBuffer<uint>   SWRTIndices;    // 3 por triangulo ORIGINAL
+//   StructuredBuffer<uint>   SWRTTriOrder;   // posicao -> triangulo original
+//   uint                  SWRTRootRef;
+// e SWRT_THREADGROUP_SIZE definido (8).
+
+#pragma once
+
+#define SWRT_CHILD_EMPTY  0xFFFFFFFFu
+#define SWRT_STACK_DEPTH  32
+#define SWRT_NODE_STRIDE  64
+
+// Pilha em groupshared (sem wave intrinsics: DX11 SM5). 64 threads * 32 * 8 B = 16 KB (< 32 KB).
+groupshared uint  SWRTStackRef[SWRT_THREADGROUP_SIZE * SWRT_THREADGROUP_SIZE * SWRT_STACK_DEPTH];
+groupshared float SWRTStackT  [SWRT_THREADGROUP_SIZE * SWRT_THREADGROUP_SIZE * SWRT_STACK_DEPTH];
+
+struct FSWRTHit
+{
+	float T;
+	uint  Tri;   // 0xFFFFFFFF = sem hit
+	float2 UV;   // baricentricas (u,v)
+};
+
+bool SWRTRefIsLeaf(uint R)    { return R != SWRT_CHILD_EMPTY && (R & 0x80000000u) != 0; }
+uint SWRTLeafCount(uint R)    { return (R >> 27) & 0xFu; }
+uint SWRTLeafFirst(uint R)    { return R & 0x07FFFFFFu; }
+uint SWRTGetByte(uint3 W, uint I) { return (W[I >> 2] >> ((I & 3u) * 8u)) & 0xFFu; }
+
+bool SWRTRayBox(float3 O, float3 InvD, float3 Lo, float3 Hi, float TMax, out float TNear)
+{
+	const float3 A = (Lo - O) * InvD;
+	const float3 B = (Hi - O) * InvD;
+	const float3 Mn = min(A, B);
+	const float3 Mx = max(A, B);
+	TNear = max(max(Mn.x, Mn.y), max(Mn.z, 0.0));
+	const float TFar = min(min(Mx.x, Mx.y), min(Mx.z, TMax));
+	return TNear <= TFar;
+}
+
+// Moller-Trumbore, dupla face.
+bool SWRTRayTri(float3 O, float3 D, float TMin, float TMax, float3 A, float3 B, float3 C, out float T, out float2 UV)
+{
+	T = 0; UV = 0;
+	const float3 E1 = B - A;
+	const float3 E2 = C - A;
+	const float3 P  = cross(D, E2);
+	const float Det = dot(E1, P);
+	if (abs(Det) < 1e-12) return false;
+	const float Inv = rcp(Det);
+	const float3 S = O - A;
+	const float U = dot(S, P) * Inv;
+	if (U < 0.0 || U > 1.0) return false;
+	const float3 Q = cross(S, E1);
+	const float V = dot(D, Q) * Inv;
+	if (V < 0.0 || U + V > 1.0) return false;
+	const float Tt = dot(E2, Q) * Inv;
+	if (Tt < TMin || Tt > TMax) return false;
+	T = Tt; UV = float2(U, V);
+	return true;
+}
+
+void SWRTTestLeaf(uint Ref, float3 O, float3 D, float TMin, inout FSWRTHit H)
+{
+	const uint First = SWRTLeafFirst(Ref);
+	const uint Count = SWRTLeafCount(Ref);
+	for (uint I = 0; I < Count; ++I)
+	{
+		const uint Tri = SWRTTriOrder[First + I];
+		const float3 A = SWRTPositions[SWRTIndices[Tri * 3 + 0]];
+		const float3 B = SWRTPositions[SWRTIndices[Tri * 3 + 1]];
+		const float3 C = SWRTPositions[SWRTIndices[Tri * 3 + 2]];
+		float T; float2 UV;
+		if (SWRTRayTri(O, D, TMin, H.T, A, B, C, T, UV) && T < H.T)
+		{
+			H.T = T; H.Tri = Tri; H.UV = UV;
+		}
+	}
+}
+
+// ThreadIndex = indice linear da thread no grupo (0 .. SWRT_THREADGROUP_SIZE^2 - 1).
+FSWRTHit SWRTTraceBvh4C(float3 O, float3 D, float TMin, float TMax, uint ThreadIndex)
+{
+	FSWRTHit H;
+	H.T = TMax; H.Tri = 0xFFFFFFFFu; H.UV = 0;
+
+	if (SWRTRootRef == SWRT_CHILD_EMPTY) return H;
+	if (SWRTRefIsLeaf(SWRTRootRef))
+	{
+		SWRTTestLeaf(SWRTRootRef, O, D, TMin, H);
+		return H;
+	}
+
+	// 1/D sem divisoes por zero
+	const float3 SafeD = float3(
+		abs(D.x) > 1e-20 ? D.x : 1e-20,
+		abs(D.y) > 1e-20 ? D.y : 1e-20,
+		abs(D.z) > 1e-20 ? D.z : 1e-20);
+	const float3 InvD = rcp(SafeD);
+
+	const uint Base = ThreadIndex * SWRT_STACK_DEPTH;
+	uint SP = 0;
+	SWRTStackRef[Base] = SWRTRootRef;
+	SWRTStackT[Base]   = 0.0;
+	SP = 1;
+
+	[loop]
+	while (SP > 0)
+	{
+		--SP;
+		const uint  Ref = SWRTStackRef[Base + SP];
+		const float Tn  = SWRTStackT[Base + SP];
+		if (Tn > H.T) continue;
+
+		if (SWRTRefIsLeaf(Ref))
+		{
+			SWRTTestLeaf(Ref, O, D, TMin, H);
+			continue;
+		}
+
+		const uint Off = Ref * SWRT_NODE_STRIDE;
+		const uint4 W0 = SWRTBvhNodes.Load4(Off + 0);   // P.xyz, ExpPacked
+		const uint4 Ch = SWRTBvhNodes.Load4(Off + 16);  // Child[4]
+		const uint3 QL = SWRTBvhNodes.Load3(Off + 32);
+		const uint3 QH = SWRTBvhNodes.Load3(Off + 44);
+
+		const float3 P = asfloat(W0.xyz);
+		const float3 Scale = float3(
+			asfloat(((W0.w >> 0)  & 0xFFu) << 23),
+			asfloat(((W0.w >> 8)  & 0xFFu) << 23),
+			asfloat(((W0.w >> 16) & 0xFFu) << 23));
+
+		uint  HitRef[4];
+		float HitT[4];
+		uint  NH = 0;
+
+		[unroll]
+		for (uint I = 0; I < 4; ++I)
+		{
+			const uint C = Ch[I];
+			if (C == SWRT_CHILD_EMPTY) continue;
+
+			const float3 Lo = P + float3(SWRTGetByte(QL, I * 3 + 0), SWRTGetByte(QL, I * 3 + 1), SWRTGetByte(QL, I * 3 + 2)) * Scale;
+			const float3 Hi = P + float3(SWRTGetByte(QH, I * 3 + 0), SWRTGetByte(QH, I * 3 + 1), SWRTGetByte(QH, I * 3 + 2)) * Scale;
+
+			float Tnear;
+			if (SWRTRayBox(O, InvD, Lo, Hi, H.T, Tnear))
+			{
+				HitRef[NH] = C; HitT[NH] = Tnear; ++NH;
+			}
+		}
+
+		// ordenar por T decrescente: o mais perto fica no topo da pilha (e e processado primeiro)
+		for (uint A = 1; A < NH; ++A)
+		{
+			const uint  KR = HitRef[A];
+			const float KT = HitT[A];
+			int J = (int)A - 1;
+			while (J >= 0 && HitT[J] < KT)
+			{
+				HitRef[J + 1] = HitRef[J]; HitT[J + 1] = HitT[J]; --J;
+			}
+			HitRef[J + 1] = KR; HitT[J + 1] = KT;
+		}
+
+		// guarda contra overflow: com BVH4 e profundidade ~10 raramente chega perto de 32
+		if (SP + NH <= SWRT_STACK_DEPTH)
+		{
+			for (uint K = 0; K < NH; ++K)
+			{
+				SWRTStackRef[Base + SP] = HitRef[K];
+				SWRTStackT[Base + SP]   = HitT[K];
+				++SP;
+			}
+		}
+	}
+	return H;
+}
